@@ -1,0 +1,389 @@
+GRPO LoRA 调参记录
+生成日期：2026-06-10
+项目目录：D:\llm_project
+
+一、记录目的
+
+本文件用于记录本项目中原模型、lora_v1、lora_v2 的训练与评测情况，重点说明：
+
+1. 第一次 LoRA 强化学习训练后，和原模型相比效果如何。
+2. 为什么认为 lora_v1 的结果不够理想。
+3. 基于 lora_v1 的问题，为什么调整训练步数和奖励权重。
+4. lora_v2 使用了哪些参数，以及目前观察到的训练信号和风险。
+
+
+二、共同实验设置
+
+基础模型：
+D:\llm_project\models\Qwen2.5-0.5B-Instruct
+
+数据集：
+D:\llm_project\data\gsm8k\main\train-00000-of-00001.parquet
+
+任务：
+使用 GRPO 强化学习训练 Qwen2.5-0.5B-Instruct，让模型在 GSM8K 数学题上学会：
+
+1. 按指定格式输出推理过程和最终答案。
+2. 尽可能提高最终数字答案的正确率。
+
+统一输出格式：
+
+<reasoning>
+...推理过程...
+</reasoning>
+<answer>
+...最终数字...
+</answer>
+
+共同训练方法：
+
+- 训练算法：GRPOTrainer
+- LoRA target modules：q_proj、k_proj、v_proj、o_proj
+- LoRA rank：r=16
+- LoRA alpha：32
+- LoRA dropout：0.05
+- 精度：fp16
+- per_device_train_batch_size：1
+- gradient_accumulation_steps：4
+- num_generations：4
+- max_prompt_length：256
+- max_completion_length：128
+- beta / KL 系数：0.04
+- 训练采样 temperature：0.9
+
+说明：
+num_generations=4 表示同一道题会生成 4 个回答，GRPO 用这 4 个回答的组内相对奖励计算 advantage。日志中记录的是平均 reward，不是逐条回答的 reward 明细。
+
+
+三、原模型与 lora_v1 的对比
+
+原模型：
+D:\llm_project\models\Qwen2.5-0.5B-Instruct
+
+lora_v1 输出目录：
+D:\llm_project\outputs\grpo-qwen0.5b
+
+lora_v1 训练日志：
+D:\llm_project\outputs\train_log.txt
+
+lora_v1 指标文件：
+D:\llm_project\outputs\metrics.tsv
+
+评测设置：
+GSM8K main 测试集前 200 条。
+
+评测结果：
+
+| 模型 | 准确率 | 格式符合率 |
+| --- | --- | --- |
+| 原模型 base | 32.0%，64/200 | 0.0%，0/200 |
+| lora_v1 | 34.0%，68/200 | 65.5%，131/200 |
+
+补充评测，GSM8K main 测试集前 100 条：
+
+| 模型 | 准确率 | 说明 |
+| --- | --- | --- |
+| lora_v1 | 40.0%，40/100 | 第一次 LoRA，在前 100 条上表现高于 200 条整体结果 |
+| lora_v2 | 31.0%，31/100 | 第二次 LoRA，在前 100 条上低于 lora_v1 |
+
+结论：
+
+lora_v1 的格式学习效果非常明显，格式符合率从 0.0% 提升到 65.5%。这说明 GRPO 的奖励函数确实起作用了，模型学会了更多地输出 <reasoning> 和 <answer> 结构。
+
+但是准确率只从 32.0% 提升到 34.0%，只多做对 4 道题。这个提升幅度偏小，不够理想。考虑到评测样本只有 200 条，+2.0 个百分点也可能包含一定随机波动。因此 lora_v1 更像是“格式训练成功”，而不是“数学能力明显提升”。
+
+补充的 100 条测试结果显示，lora_v1 在前 100 条上达到 40.0%，而 lora_v2 只有 31.0%。这进一步说明：lora_v2 虽然训练时 reward_correct 明显升高，但这种训练奖励提升没有直接转化为 held-out 测试集上的贪心解码准确率提升。
+
+
+四、lora_v1 的训练参数
+
+最大训练步数：
+120 steps
+
+保存间隔：
+每 60 steps 保存一次 checkpoint。
+
+奖励函数权重：
+
+- 答案正确奖励：+2.0
+- 完整格式奖励：+0.5
+- 部分格式奖励：每个标签 +0.125，最多 +0.5
+- 单条回答理论最高奖励：3.0
+
+四个部分格式标签是：
+
+- <reasoning>
+- </reasoning>
+- <answer>
+- </answer>
+
+lora_v1 最后一步 step 120 指标：
+
+- reward：0.8984
+- reward_correct：0.3750
+- reward_format：0.2188
+- reward_partial：0.3047
+- KL：0.05573
+- completion_len：110.2
+
+lora_v1 最后 50 步平均指标：
+
+- reward：0.5389
+- reward_correct：0.2225
+- reward_format：0.1037
+- reward_partial：0.2127
+- KL：0.04383
+- completion_len：117.3
+
+lora_v1 最后 20 步平均指标：
+
+- reward：0.6863
+- reward_correct：0.2938
+- KL：0.04917
+
+lora_v1 最大记录 KL：
+0.06841
+
+
+五、为什么认为 lora_v1 不理想
+
+lora_v1 的核心问题是：格式提升很大，但准确率提升很小。
+
+可能原因如下：
+
+1. 格式奖励太容易获得
+
+模型只要学会输出固定标签，就能拿到较稳定的格式奖励。相比之下，数学答案正确奖励更稀疏，模型必须真的生成正确数字才能拿到高分。因此训练早期更容易优先学格式。
+
+2. 正确性奖励信号较稀疏
+
+GSM8K 的最终答案必须数字完全正确才给分。对于 0.5B 小模型来说，很多回答即使格式正确，最终数字也可能错误，导致正确性奖励不够稳定。
+
+3. 训练步数较少
+
+lora_v1 只训练了 120 步，更适合验证 GRPO 流程是否跑通，不一定足以稳定提高数学能力。
+
+4. 小模型能力上限有限
+
+Qwen2.5-0.5B-Instruct 参数规模较小，GRPO 可以调整输出偏好，但不一定能大幅提升复杂数学推理能力。
+
+5. 纯 RL 没有 SFT 打底
+
+本项目刻意使用规则奖励而不是监督答案示范。这样可以展示 RLVR 的效果，但如果目标是准确率，通常先做 SFT 再做 GRPO 会更稳定。
+
+
+六、从 lora_v1 到 lora_v2 的调整思路
+
+基于上面的分析，lora_v2 做了两个主要调整：
+
+1. 增加训练步数
+
+目的：
+让模型有更多机会从正确答案奖励中学习，而不是只停留在格式学习阶段。
+
+原计划：
+从 120 步增加到 500 步。
+
+实际执行：
+训练启动时为 500 步，但后来决定在 checkpoint-300 处停止，并将 checkpoint-300 作为最终 lora_v2 权重。
+
+原因：
+训练到 300 步时，正确性奖励已经明显上升；同时 KL 也明显升高。如果继续跑到 500 步，可能进一步偏离原模型，增加过拟合或能力退化风险。
+
+2. 调整奖励权重，强化答案正确性
+
+lora_v1 奖励：
+
+- 正确答案：+2.0
+- 完整格式：+0.5
+- 部分格式最多：+0.5
+
+lora_v2 奖励：
+
+- 正确答案：+3.0
+- 完整格式：+0.2
+- 部分格式最多：+0.2
+
+调整理由：
+降低格式奖励占比，减少模型“只学格式”的倾向；提高正确答案奖励，让训练信号更偏向数学答案正确。
+
+
+七、lora_v2 的训练参数
+
+lora_v2 输出目录：
+D:\llm_project\outputs\lora_v2
+
+lora_v2 指标文件：
+D:\llm_project\outputs\metrics_lora_v2.tsv
+
+lora_v2 训练日志：
+D:\llm_project\outputs\train_log_lora_v2.txt
+
+lora_v2 监控文件：
+D:\llm_project\outputs\monitor_lora_v2.tsv
+
+lora_v2 接管日志：
+D:\llm_project\outputs\finalize_lora_v2_at_300.log
+
+最终 lora_v2 权重来源：
+D:\llm_project\outputs\lora_v2\checkpoint-300
+
+checkpoint-300 已复制到：
+D:\llm_project\outputs\lora_v2
+
+保留的 checkpoint：
+
+- D:\llm_project\outputs\lora_v2\checkpoint-100
+- D:\llm_project\outputs\lora_v2\checkpoint-200
+- D:\llm_project\outputs\lora_v2\checkpoint-300
+
+lora_v2 奖励函数权重：
+
+- 答案正确奖励：+3.0
+- 完整格式奖励：+0.2
+- 部分格式奖励：每个标签 +0.05，最多 +0.2
+- 单条回答理论最高奖励：3.4
+
+lora_v2 训练过程说明：
+
+- 初始启动时 max_steps=500。
+- 后来决定将 checkpoint-300 作为最终权重。
+- checkpoint-300 保存稳定后，自动复制 checkpoint-300 中的 LoRA 文件到 lora_v2 根目录。
+- 然后停止训练进程。
+- metrics_lora_v2.tsv 中出现 step 301，是因为训练进程在 checkpoint-300 保存后又向前推进了一步才被停止。最终权重仍以 checkpoint-300 为准。
+
+
+八、lora_v2 的训练指标
+
+step 300 指标：
+
+- reward：0.2813
+- reward_correct：0.0000
+- reward_format：0.1250
+- reward_partial：0.1563
+- KL：0.09494
+- completion_len：102.6
+
+step 301 指标，仅作为停止前的额外日志参考，不代表最终权重：
+
+- reward：1.2250
+- reward_correct：0.9375
+- reward_format：0.1250
+- reward_partial：0.1625
+- KL：0.11115
+- completion_len：95.8
+
+lora_v2 最后 50 步平均指标，按 metrics 文件末尾统计：
+
+- reward：1.2155
+- reward_correct：0.9000
+- reward_format：0.1473
+- reward_partial：0.1682
+- KL：0.10422
+- completion_len：97.6
+
+lora_v2 最后 20 步平均指标：
+
+- reward：1.0842
+- reward_correct：0.7781
+- KL：0.10174
+
+lora_v2 最大记录 KL：
+0.58135
+
+
+九、lora_v2 的初步观察
+
+训练指标上看，lora_v2 相比 lora_v1 有明显变化：
+
+1. reward_correct 明显提高
+
+lora_v1 最后 50 步平均 reward_correct：0.2225
+lora_v2 最后 50 步平均 reward_correct：0.9000
+
+这说明在训练采样分布中，lora_v2 更频繁地产生能拿到正确性奖励的回答。
+
+2. completion_len 下降
+
+lora_v1 最后 50 步平均 completion_len：117.3
+lora_v2 最后 50 步平均 completion_len：97.6
+
+这说明模型回答更短，更少贴近 max_completion_length=128 的上限，可能更快完成格式化答案。
+
+3. KL 明显升高
+
+lora_v1 最后 50 步平均 KL：0.04383
+lora_v2 最后 50 步平均 KL：0.10422
+
+这说明 lora_v2 比 lora_v1 更明显地偏离了原始模型。偏离更大可能带来更强的奖励优化，但也可能损伤原模型已有的推理能力。
+
+4. 评测准确率存在下降风险
+
+用 GSM8K main 测试集前 100 条评测时，lora_v1 准确率为 40.0%，lora_v2 准确率为 31.0%。虽然 lora_v2 的训练 reward_correct 明显高于 lora_v1，但测试准确率反而下降。这说明训练 reward 上升不一定等价于测试集 greedy 解码准确率上升。
+
+可能原因：
+
+- 训练时使用 temperature=0.9 采样，评测时使用 do_sample=False 贪心解码，两者分布不同。
+- GRPO 优化的是训练采样回答的相对奖励，不是直接优化测试集准确率。
+- KL 偏高时，模型可能偏离原模型过多，导致泛化能力下降。
+- 正确性奖励依赖 <answer>...</answer> 中的数字提取，格式仍然是正确性奖励的前置条件。
+- lora_v2 的正确性奖励更高、训练步数更多，使模型更强地追逐训练奖励；这可能带来 reward overfitting，即训练采样中的奖励变高，但泛化到测试集时变差。
+- lora_v2 的 KL 明显高于 lora_v1，说明它偏离原模型更多；对 0.5B 小模型来说，偏离过大可能损伤原本的推理和算术稳定性。
+- lora_v2 的格式符合率很高，但格式正确不代表推理正确；模型可能更稳定地输出 <answer>，但里面的数字并没有更可靠。
+
+
+十、下一步建议
+
+为了判断 lora_v2 具体是“奖励设计不合适”还是“训练到 300 步过头”，建议做同样测试集数量的对比：
+
+python scripts\04_eval.py base 100
+python scripts\04_eval.py lora_v1 100
+python scripts\04_eval.py lora_v2 100
+
+已知当前 100 条结果：lora_v1 为 40.0%，lora_v2 为 31.0%。因此后续重点不是继续证明 v2 是否下降，而是定位下降发生在奖励设计、训练步数，还是 checkpoint 选择。
+
+同时评测 lora_v2 的不同 checkpoint：
+
+python scripts\04_eval.py lora D:\llm_project\outputs\lora_v2\checkpoint-100 100
+python scripts\04_eval.py lora D:\llm_project\outputs\lora_v2\checkpoint-200 100
+python scripts\04_eval.py lora D:\llm_project\outputs\lora_v2\checkpoint-300 100
+
+如果 checkpoint-100 或 checkpoint-200 准确率高于 checkpoint-300，说明 lora_v2 可能训练过头。
+
+如果所有 lora_v2 checkpoint 都低于 lora_v1，则说明这次奖励设计可能不适合提升测试集准确率。
+
+后续可尝试：
+
+1. 提高 KL 约束
+
+例如将 beta 从 0.04 提高到 0.06 或 0.08，减少模型偏离原模型的程度。
+
+2. 恢复一部分格式奖励
+
+例如：
+
+- 正确答案：+3.0
+- 完整格式：+0.3
+- 部分格式最多：+0.3
+
+这样仍然以正确性为主，但给模型保留更稳定的格式引导。
+
+3. 缩短训练步数
+
+如果 checkpoint-100 或 checkpoint-200 更好，可以将后续训练目标设为 100-200 步，而不是 300 步以上。
+
+4. 加 SFT warmup
+
+如果目标是显著提升数学准确率，而不仅是验证 RLVR 流程，建议先用 GSM8K 的标准解题过程做少量 SFT，再做 GRPO。
+
+
+十一、阶段性总结
+
+lora_v1：
+120 步，格式奖励较高。结果是格式符合率大幅提升，准确率只小幅提升。说明 GRPO 跑通且格式学习成功，但数学准确率提升不理想。
+
+lora_v2：
+正确性奖励更高，格式奖励更低，训练到 checkpoint-300。训练日志中正确性奖励明显提高，回答长度下降，但 KL 明显升高。在前 100 条测试集上准确率为 31.0%，低于 lora_v1 的 40.0%，说明这次调整没有提升泛化准确率，反而可能出现 reward overfitting 或过度偏离原模型。
+
+当前判断：
+lora_v2 的训练奖励更好，但泛化准确率更差。下一步应优先比较 lora_v2 的 checkpoint-100/200/300 在相同 100 条测试集上的准确率，判断是 checkpoint-300 训练过头，还是 v2 的奖励权重整体不合适。
